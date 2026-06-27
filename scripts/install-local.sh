@@ -4,18 +4,25 @@ set -euo pipefail
 APP_DIR="$HOME/.local/share/umans-factory-provider"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 
-if ! command -v bun >/dev/null 2>&1; then
+if ! BUN_BIN="$(command -v bun)"; then
   echo "Bun is required: https://bun.sh/docs/installation" >&2
   exit 1
 fi
 
-mkdir -p "$APP_DIR" "$APP_DIR/.config" "$SYSTEMD_DIR"
+mkdir -p "$APP_DIR" "$APP_DIR/.config" "$APP_DIR/bin" "$SYSTEMD_DIR"
 
 for path in proxy.js dashboard.html package.json src scripts config integrations systemd LICENSE README.md; do
   if [ -e "$path" ]; then
     cp -R "$path" "$APP_DIR/"
   fi
 done
+
+cat > "$APP_DIR/bin/bun" <<EOF
+#!/usr/bin/env sh
+exec "$BUN_BIN" "\$@"
+EOF
+chmod 0755 "$APP_DIR/bin/bun"
+echo "Pinned Bun executable: $BUN_BIN"
 
 if [ ! -f "$APP_DIR/.config/config.json" ]; then
   cp "$APP_DIR/config/config.example.json" "$APP_DIR/.config/config.json"

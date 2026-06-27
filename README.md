@@ -31,6 +31,8 @@ cd umans-factory-provider
 ./scripts/install-local.sh
 ```
 
+The installer pins the `bun` executable currently on `PATH` into a local wrapper, so the user services work even when Bun is not installed at `~/.bun/bin`.
+
 ### 2. Configure UMANS API key
 
 Edit:
