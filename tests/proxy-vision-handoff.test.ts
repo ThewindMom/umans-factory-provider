@@ -79,7 +79,7 @@ async function startProxy(upstreamPort: number): Promise<number> {
   return proxyPort;
 }
 
-async function startMockUpstream(captured: CapturedBody[]): Promise<number> {
+async function startMockUpstream(captured: CapturedBody[], handoffs: CapturedBody[] = []): Promise<number> {
   const port = await freePort();
   const catalog = {
     'umans-glm-5.2': {
@@ -107,6 +107,7 @@ async function startMockUpstream(captured: CapturedBody[]): Promise<number> {
       if (url.pathname === '/v1/chat/completions') {
         const body = await req.json();
         if (body.model === 'umans-kimi-k2.7') {
+          handoffs.push(body);
           return json({
             id: 'handoff',
             object: 'chat.completion',
@@ -135,7 +136,8 @@ afterEach(() => {
 
 test('Factory Anthropic image requests use target override and trusted handoff framing', async () => {
   const captured: CapturedBody[] = [];
-  const upstreamPort = await startMockUpstream(captured);
+  const handoffs: CapturedBody[] = [];
+  const upstreamPort = await startMockUpstream(captured, handoffs);
   const proxyPort = await startProxy(upstreamPort);
 
   const resp = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
@@ -156,6 +158,12 @@ test('Factory Anthropic image requests use target override and trusted handoff f
 
   expect(resp.status).toBe(200);
   expect(captured).toHaveLength(1);
+  expect(handoffs).toHaveLength(1);
+  const handoffJson = JSON.stringify(handoffs[0]);
+  expect(handoffJson).toContain('User question for context');
+  expect(handoffJson).toContain('prioritize visual evidence relevant to this request');
+  expect(handoffJson).toContain('What can you see?');
+  expect(handoffJson).not.toContain('What do you see in this image?');
   const finalBody = captured[0];
   const finalJson = JSON.stringify(finalBody);
   expect(finalBody.model).toBe('umans-glm-5.2');
@@ -168,7 +176,8 @@ test('Factory Anthropic image requests use target override and trusted handoff f
 
 test('OpenAI image requests to GLM are converted before final upstream forwarding', async () => {
   const captured: CapturedBody[] = [];
-  const upstreamPort = await startMockUpstream(captured);
+  const handoffs: CapturedBody[] = [];
+  const upstreamPort = await startMockUpstream(captured, handoffs);
   const proxyPort = await startProxy(upstreamPort);
 
   const resp = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
@@ -188,6 +197,10 @@ test('OpenAI image requests to GLM are converted before final upstream forwardin
 
   expect(resp.status).toBe(200);
   expect(captured).toHaveLength(1);
+  expect(handoffs).toHaveLength(1);
+  const handoffJson = JSON.stringify(handoffs[0]);
+  expect(handoffJson).toContain('User question for context');
+  expect(handoffJson).toContain('What colors are visible?');
   const finalBody = captured[0];
   const finalJson = JSON.stringify(finalBody);
   expect(finalBody.model).toBe('umans-glm-5.2');
@@ -195,4 +208,41 @@ test('OpenAI image requests to GLM are converted before final upstream forwardin
   expect(finalJson).toContain('Trusted vision handoff observation');
   expect(finalJson).not.toContain('image_url');
   expect(finalJson).not.toContain('[User pasted image]');
+});
+
+test('vision handoff uses the latest user question as context for older attached images', async () => {
+  const captured: CapturedBody[] = [];
+  const handoffs: CapturedBody[] = [];
+  const upstreamPort = await startMockUpstream(captured, handoffs);
+  const proxyPort = await startProxy(upstreamPort);
+
+  const resp = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'umans-glm-5.2',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Broadly describe the screenshot.' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+          ],
+        },
+        {
+          role: 'user',
+          content: 'Rate the warning badge from 1 to 10 and identify the top-right code.',
+        },
+      ],
+    }),
+  });
+
+  expect(resp.status).toBe(200);
+  expect(captured).toHaveLength(1);
+  expect(handoffs).toHaveLength(1);
+  const handoffJson = JSON.stringify(handoffs[0]);
+  expect(handoffJson).toContain('User question for context');
+  expect(handoffJson).toContain('Rate the warning badge from 1 to 10');
+  expect(handoffJson).toContain('top-right code');
+  expect(handoffJson).not.toContain('Broadly describe the screenshot.');
 });
