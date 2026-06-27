@@ -11,7 +11,7 @@ Restart=on-failure
 RestartSec=2
 Environment=UMANS_LIMITER_HOST=127.0.0.1
 Environment=UMANS_LIMITER_PORT=8319
-Environment=UMANS_LIMITER_MAX_CONCURRENCY=4
+Environment=UMANS_LIMITER_MAX_CONCURRENCY=3
 Environment=UMANS_LIMITER_UPSTREAM=https://api.code.umans.ai
 
 [Install]

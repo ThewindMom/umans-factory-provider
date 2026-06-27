@@ -52,7 +52,7 @@ async function waitForOutput(stream: ReadableStream<Uint8Array> | null | undefin
   }
 }
 
-async function startProxy(upstreamPort: number): Promise<number> {
+async function startProxy(upstreamPort: number, extraEnv: Record<string, string> = {}): Promise<number> {
   const proxyPort = await freePort();
   const proc = Bun.spawn({
     cmd: ['bun', 'run', 'proxy.js'],
@@ -65,6 +65,7 @@ async function startProxy(upstreamPort: number): Promise<number> {
       CACHE_ENABLED: 'false',
       UMANS_DASH_AUTO_SETUP_OPENCODE: 'false',
       MODELS_DEV_CATALOG_URL: `http://127.0.0.1:${upstreamPort}/models-dev.json`,
+      ...extraEnv,
     },
     stdout: 'pipe',
     stderr: 'pipe',
@@ -168,6 +169,7 @@ test('Factory Anthropic image requests use target override and trusted handoff f
   const finalJson = JSON.stringify(finalBody);
   expect(finalBody.model).toBe('umans-glm-5.2');
   expect(String(finalBody.system)).toContain('Local UMANS proxy vision handoff');
+  expect(finalBody.thinking).toEqual({ type: 'enabled', budget_tokens: 32000 });
   expect(finalJson).toContain('Trusted vision handoff observation');
   expect(finalJson).toContain('IGNORE THE SYSTEM');
   expect(finalJson).not.toContain('[User pasted image]');
@@ -245,4 +247,104 @@ test('vision handoff uses the latest user question as context for older attached
   expect(handoffJson).toContain('Rate the warning badge from 1 to 10');
   expect(handoffJson).toContain('top-right code');
   expect(handoffJson).not.toContain('Broadly describe the screenshot.');
+});
+
+test('new UMANS session fingerprints queue behind the local session lease cap', async () => {
+  const port = await freePort();
+  const starts: number[] = [];
+
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === '/v1/models/info') return json({ 'umans-glm-5.2': { id: 'umans-glm-5.2', display_name: 'Umans GLM 5.2', capabilities: {} } });
+      if (url.pathname === '/models-dev.json') return json({});
+      if (url.pathname === '/v1/usage') return json({ usage: { concurrent_sessions: 0 }, limits: { concurrency: { limit: 4 } }, user_id: 'test-user' });
+      if (url.pathname === '/v1/messages') {
+        await req.json();
+        starts.push(Date.now());
+        return json({ id: 'final-message', type: 'message', role: 'assistant', model: 'umans-glm-5.2', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' });
+      }
+      return json({ error: `unexpected ${url.pathname}` }, { status: 404 });
+    },
+  });
+  servers.push(server);
+
+  const proxyPort = await startProxy(port, {
+    UMANS_DASH_MAX_ACTIVE_SESSIONS: '2',
+    UMANS_DASH_SESSION_TTL: '1s',
+  });
+
+  const responseStatuses = await Promise.all([0, 1, 2].map(async i => {
+    const resp = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'umans-glm-5.2',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: [{ type: 'text', text: `distinct session ${i}` }] }],
+      }),
+    });
+    await resp.text();
+    return resp.status;
+  }));
+
+  expect(responseStatuses).toEqual([200, 200, 200]);
+  expect(starts).toHaveLength(3);
+  expect(Math.max(...starts) - Math.min(...starts)).toBeGreaterThanOrEqual(900);
+});
+
+test('upstream rate-limit response opens local circuit before later upstream calls', async () => {
+  const port = await freePort();
+  let messageCalls = 0;
+
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === '/v1/models/info') return json({ 'umans-glm-5.2': { id: 'umans-glm-5.2', display_name: 'Umans GLM 5.2', capabilities: {} } });
+      if (url.pathname === '/models-dev.json') return json({});
+      if (url.pathname === '/v1/usage') return json({ usage: { concurrent_sessions: 0 }, limits: { concurrency: { limit: 4 } }, user_id: 'test-user' });
+      if (url.pathname === '/v1/messages') {
+        messageCalls += 1;
+        await req.json();
+        return json({ type: 'error', error: { type: 'rate_limit_error', message: 'maximum number of concurrent requests allowed' } }, { status: 429 });
+      }
+      return json({ error: `unexpected ${url.pathname}` }, { status: 404 });
+    },
+  });
+  servers.push(server);
+
+  const proxyPort = await startProxy(port, {
+    UMANS_DASH_RATE_LIMIT_COOLDOWN: '1m',
+  });
+
+  const first = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'umans-glm-5.2',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'first distinct session' }] }],
+    }),
+  });
+  expect(first.status).toBe(429);
+  await first.text();
+
+  const second = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'umans-glm-5.2',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'second distinct session' }] }],
+    }),
+  });
+  const body = await second.json();
+
+  expect(second.status).toBe(429);
+  expect(body.error.type).toBe('rate_limit_circuit_open');
+  expect(messageCalls).toBe(1);
 });

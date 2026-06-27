@@ -16,7 +16,7 @@ Factory / OMP / clients
 - **Factory Droid custom model** for `umans-glm-5.2`.
 - **GLM image attachments via handoff**: image inputs are analyzed by `umans-kimi-k2.7`, then forwarded to GLM as trusted visual observations.
 - **Prompt-injection-aware image framing**: text visible inside images is treated as visual evidence, not instructions.
-- **Strict local concurrency limiter**: all upstream requests pass through a semaphore, not just selected routes.
+- **Strict local rate limiter**: upstream HTTP requests pass through a semaphore, and new UMANS session fingerprints are leased locally before forwarding.
 - **Automatic image cap**: prunes excessive image attachments before forwarding.
 - **Dashboard** at `http://127.0.0.1:8084` for health, models, cache, usage, and key management.
 - **No checked-in secrets**: `.config/config.json`, logs, sessions, images, and env files are ignored.
@@ -156,27 +156,37 @@ This fixes the common failure mode where a text-only final model sees a placehol
 
 ## Strict rate limiting
 
-`src/umans-limiter.ts` is intentionally simple: every request to the upstream API is gated by one semaphore.
+`src/umans-limiter.ts` gates every upstream HTTP request with one semaphore. The dashboard also gates new UMANS conversation fingerprints with a session lease so agent fan-out cannot create more account sessions than the local cap allows.
 
-Default:
+Defaults:
 
 ```text
-UMANS_LIMITER_MAX_CONCURRENCY=4
+UMANS_LIMITER_MAX_CONCURRENCY=3
+UMANS_DASH_MAX_ACTIVE_SESSIONS=3
+UMANS_DASH_SESSION_TTL=30m
+UMANS_DASH_RATE_LIMIT_COOLDOWN=5m
 UMANS_LIMITER_UPSTREAM=https://api.code.umans.ai
 ```
+
+The limit intentionally stays below UMANS' advertised `4` concurrency ceiling to leave headroom for handoff/model-info/internal calls and account-side session accounting.
 
 Metrics:
 
 ```bash
 curl http://127.0.0.1:8319/metrics
+curl http://127.0.0.1:8084/api/umans/concurrency
 ```
 
 Expected policy:
 
 ```json
 {
-  "maxConcurrent": 4,
-  "limitedPolicy": "all upstream requests"
+  "maxConcurrent": 3,
+  "limitedPolicy": "all upstream requests",
+  "gateway": {
+    "sessions": { "limit": 3 },
+    "circuit": { "open": false }
+  }
 }
 ```
 
@@ -228,7 +238,10 @@ Most important fields:
 | `MAX_IMAGES` | `9` | Maximum images forwarded per request |
 | `VISION_HANDOFF_ENABLED` | `true` | Enable GLM image handoff |
 | `VISION_HANDOFF_MODEL` | `umans-kimi-k2.7` | Vision model used for image descriptions |
-| `OVERRIDE_CONCURRENCY` | `0` | Optional dashboard queue override; strict limiter remains authoritative |
+| `OVERRIDE_CONCURRENCY` | `0` | Optional dashboard HTTP queue override; strict limiter and session leases remain authoritative |
+| `MAX_ACTIVE_SESSIONS` | `3` | Maximum leased UMANS conversation fingerprints before new sessions queue locally |
+| `SESSION_TTL` | `30m` | Idle time before a leased session fingerprint is released |
+| `RATE_LIMIT_COOLDOWN` | `5m` | Local circuit-breaker pause after upstream rate-limit responses without a reactivation timestamp |
 
 ## License
 

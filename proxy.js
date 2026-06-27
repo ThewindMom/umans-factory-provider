@@ -308,6 +308,199 @@ function writeAnthropicPassthroughError(res, statusCode, body) {
 
 let activeRequests = 0;
 let requestQueue = [];
+let activeSessionLeases = new Map(); // fingerprint -> { firstSeen, lastSeen, expiresAt, sessNum }
+let sessionLeaseTimer = null;
+let rateLimitCircuit = { openUntil: 0, status: 0, message: '', openedAt: 0 };
+
+function sessionLeaseLimit() {
+  return Math.max(1, config?.maxActiveSessions || 3);
+}
+
+function sessionLeaseTtlMs() {
+  return Math.max(1000, config?.sessionLeaseTtl || 30 * 60 * 1000);
+}
+
+function rateLimitCooldownMs() {
+  return Math.max(1000, config?.rateLimitCooldown || 5 * 60 * 1000);
+}
+
+function pruneSessionLeases(now = Date.now()) {
+  let expired = 0;
+  for (const [fingerprint, lease] of activeSessionLeases) {
+    if (lease.expiresAt <= now) {
+      activeSessionLeases.delete(fingerprint);
+      expired++;
+    }
+  }
+  return expired;
+}
+
+function scheduleSessionLeasePrune() {
+  if (sessionLeaseTimer) {
+    clearTimeout(sessionLeaseTimer);
+    sessionLeaseTimer = null;
+  }
+  if (activeSessionLeases.size === 0) return;
+  const now = Date.now();
+  let nextExpiry = Infinity;
+  for (const lease of activeSessionLeases.values()) {
+    nextExpiry = Math.min(nextExpiry, lease.expiresAt);
+  }
+  if (!Number.isFinite(nextExpiry)) return;
+  sessionLeaseTimer = setTimeout(() => {
+    sessionLeaseTimer = null;
+    pruneSessionLeases();
+    processQueue();
+    scheduleSessionLeasePrune();
+  }, Math.max(1, nextExpiry - now));
+  sessionLeaseTimer.unref?.();
+}
+
+function canAcquireSessionLease(fingerprint) {
+  if (!fingerprint) return true;
+  pruneSessionLeases();
+  if (activeSessionLeases.has(fingerprint)) return true;
+  return activeSessionLeases.size < sessionLeaseLimit();
+}
+
+function reserveSessionLease(fingerprint) {
+  if (!fingerprint) return;
+  const now = Date.now();
+  pruneSessionLeases(now);
+  const ttl = sessionLeaseTtlMs();
+  const existing = activeSessionLeases.get(fingerprint);
+  if (existing) {
+    existing.lastSeen = now;
+    existing.expiresAt = now + ttl;
+  } else {
+    activeSessionLeases.set(fingerprint, { firstSeen: now, lastSeen: now, expiresAt: now + ttl, sessNum: null });
+  }
+  scheduleSessionLeasePrune();
+}
+
+function refreshSessionLease(fingerprint, session) {
+  if (!fingerprint) return;
+  reserveSessionLease(fingerprint);
+  const lease = activeSessionLeases.get(fingerprint);
+  if (lease && session?.sessNum) lease.sessNum = session.sessNum;
+}
+
+function parseUpstreamErrorBody(body) {
+  const raw = String(body || '');
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      type: parsed?.error?.type || parsed?.type || '',
+      message: parsed?.error?.message || parsed?.message || raw,
+      raw,
+    };
+  } catch {
+    return { type: '', message: raw, raw };
+  }
+}
+
+function parseCircuitOpenUntil(message) {
+  const match = String(message || '').match(/reactivates automatically at\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2})\s+UTC/i);
+  if (!match) return 0;
+  const ts = Date.parse(`${match[1]}T${match[2]}:${match[3]}:00Z`);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function getRateLimitCircuitState(now = Date.now()) {
+  if (rateLimitCircuit.openUntil > now) {
+    return {
+      open: true,
+      status: rateLimitCircuit.status,
+      message: rateLimitCircuit.message,
+      openedAt: rateLimitCircuit.openedAt ? new Date(rateLimitCircuit.openedAt).toISOString() : null,
+      openUntil: new Date(rateLimitCircuit.openUntil).toISOString(),
+      retryAfterMs: rateLimitCircuit.openUntil - now,
+    };
+  }
+  if (rateLimitCircuit.openUntil) {
+    rateLimitCircuit = { openUntil: 0, status: 0, message: '', openedAt: 0 };
+  }
+  return { open: false };
+}
+
+function writeGatewayRateLimitError(res, format, state = getRateLimitCircuitState()) {
+  const status = state.status === 403 ? 403 : 429;
+  const retryText = state.openUntil ? ` Retry after ${state.openUntil}.` : '';
+  const upstreamText = state.message ? ` Upstream said: ${state.message}` : '';
+  const message = `UMANS upstream is paused locally after a rate-limit response.${retryText}${upstreamText}`.trim();
+  if (format === 'anthropic') {
+    writeAnthropicError(res, status, message, 'rate_limit_circuit_open');
+  } else {
+    writeOpenAIError(res, status, message, 'rate_limit_circuit_open', 'rate_limit_circuit_open');
+  }
+}
+
+function rejectQueuedForCircuit(state = getRateLimitCircuitState()) {
+  if (!state.open || requestQueue.length === 0) return;
+  const queued = requestQueue.splice(0);
+  for (const item of queued) {
+    if (!item.res.writableEnded) writeGatewayRateLimitError(item.res, item.format, state);
+  }
+}
+
+function recordRateLimitCircuit(status, body) {
+  const parsed = parseUpstreamErrorBody(body);
+  const haystack = `${parsed.type} ${parsed.message} ${parsed.raw}`.toLowerCase();
+  const isRateLimit = status === 429 || haystack.includes('rate_limit_error') || haystack.includes('maximum number of concurrent requests');
+  const isSuspension = status === 403 && (haystack.includes('account_suspended') || haystack.includes('billing_error') || haystack.includes('access is paused'));
+  if (!isRateLimit && !isSuspension) return;
+
+  const parsedUntil = parseCircuitOpenUntil(parsed.message);
+  const fallbackUntil = Date.now() + rateLimitCooldownMs();
+  const openUntil = parsedUntil > Date.now() ? parsedUntil : fallbackUntil;
+  if (openUntil <= rateLimitCircuit.openUntil) return;
+
+  rateLimitCircuit = {
+    openUntil,
+    status,
+    message: parsed.message.slice(0, 500),
+    openedAt: Date.now(),
+  };
+  console.log(`[Circuit] UMANS rate-limit circuit open until ${new Date(openUntil).toISOString()} after upstream ${status}`);
+  rejectQueuedForCircuit(getRateLimitCircuitState());
+}
+
+function gatewayMetrics() {
+  pruneSessionLeases();
+  const leasedFingerprints = new Set(activeSessionLeases.keys());
+  return {
+    activeRequests,
+    queuedRequests: requestQueue.length,
+    sessions: {
+      active: activeSessionLeases.size,
+      limit: sessionLeaseLimit(),
+      ttlMs: sessionLeaseTtlMs(),
+      queuedNew: requestQueue.filter(item => item.fingerprint && !leasedFingerprints.has(item.fingerprint)).length,
+    },
+    circuit: getRateLimitCircuitState(),
+  };
+}
+
+function canStartGatewayItem(item) {
+  if (getRateLimitCircuitState().open) return false;
+  const limit = getEffectiveConcurrency().limit;
+  if (limit !== null && activeRequests >= limit) return false;
+  return canAcquireSessionLease(item.fingerprint);
+}
+
+function enqueueGatewayItem(item) {
+  requestQueue.push(item);
+  scheduleSessionLeasePrune();
+}
+
+function startGatewayItem(item) {
+  reserveSessionLease(item.fingerprint);
+  activeRequests++;
+  const run = item.format === 'anthropic'
+    ? proxyAnthropicRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.req, item.fingerprint)
+    : proxyChatRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.req, item.fingerprint);
+  run.finally(() => { activeRequests--; processQueue(); });
+}
 
 let modelCatalogCache = null;
 let modelCatalogCacheTime = 0;
@@ -452,6 +645,9 @@ function loadConfig() {
     CACHE_ENABLED: true,
     OVERRIDE_CONCURRENCY: 0,
     MAX_IMAGES: 9,
+    MAX_ACTIVE_SESSIONS: 3,
+    SESSION_TTL: '30m',
+    RATE_LIMIT_COOLDOWN: '5m',
   };
   if (fs.existsSync(configPath)) {
     try {
@@ -468,6 +664,9 @@ function loadConfig() {
   if (process.env.CACHE_ENABLED) rawConfig.CACHE_ENABLED = process.env.CACHE_ENABLED !== 'false';
   if (process.env.OVERRIDE_CONCURRENCY) rawConfig.OVERRIDE_CONCURRENCY = parseInt(process.env.OVERRIDE_CONCURRENCY);
   if (process.env.MAX_IMAGES) rawConfig.MAX_IMAGES = parseInt(process.env.MAX_IMAGES);
+  if (process.env.UMANS_DASH_MAX_ACTIVE_SESSIONS) rawConfig.MAX_ACTIVE_SESSIONS = parseInt(process.env.UMANS_DASH_MAX_ACTIVE_SESSIONS);
+  if (process.env.UMANS_DASH_SESSION_TTL) rawConfig.SESSION_TTL = process.env.UMANS_DASH_SESSION_TTL;
+  if (process.env.UMANS_DASH_RATE_LIMIT_COOLDOWN) rawConfig.RATE_LIMIT_COOLDOWN = process.env.UMANS_DASH_RATE_LIMIT_COOLDOWN;
   if (process.env.SLEEV_ENABLED !== undefined) rawConfig.SLEEV_ENABLED = process.env.SLEEV_ENABLED !== 'false';
 
   const requestTimeout = parseDuration(rawConfig.REQUEST_TIMEOUT);
@@ -501,6 +700,9 @@ function loadConfig() {
     freegenPrompt: rawConfig.FREEGEN_PROMPT || 'epic cinematic landscape, mountains at sunset, vibrant colors, ultra detailed, 16:9 wallpaper',
     overrideConcurrency: Math.max(0, rawConfig.OVERRIDE_CONCURRENCY || 0),
     maxImages: Math.max(1, rawConfig.MAX_IMAGES || 9),
+    maxActiveSessions: Math.max(1, rawConfig.MAX_ACTIVE_SESSIONS || 3),
+    sessionLeaseTtl: parseDuration(rawConfig.SESSION_TTL || '30m') || 30 * 60 * 1000,
+    rateLimitCooldown: parseDuration(rawConfig.RATE_LIMIT_COOLDOWN || '5m') || 5 * 60 * 1000,
     disabledModels: Array.isArray(rawConfig.DISABLED_MODELS) ? rawConfig.DISABLED_MODELS : [],
     locale: rawConfig.LOCALE || null,
     visionHandoffEnabled: rawConfig.VISION_HANDOFF_ENABLED !== false,
@@ -564,6 +766,9 @@ function saveConfig(cfg) {
     FREEGEN_PROMPT: cfg.freegenPrompt || 'epic cinematic landscape, mountains at sunset, vibrant colors, ultra detailed, 16:9 wallpaper',
     OVERRIDE_CONCURRENCY: cfg.overrideConcurrency || 0,
     MAX_IMAGES: cfg.maxImages || 9,
+    MAX_ACTIVE_SESSIONS: cfg.maxActiveSessions || 3,
+    SESSION_TTL: `${(cfg.sessionLeaseTtl || 30 * 60 * 1000) / (60 * 1000)}m`,
+    RATE_LIMIT_COOLDOWN: `${(cfg.rateLimitCooldown || 5 * 60 * 1000) / (60 * 1000)}m`,
     DISABLED_MODELS: cfg.disabledModels || [],
     LOCALE: cfg.locale || null,
     VISION_HANDOFF_ENABLED: cfg.visionHandoffEnabled !== false,
@@ -1664,6 +1869,22 @@ function resolveModelId(requestedModel, req) {
   return direct || requestedModel;
 }
 
+function forceFactoryGlm52MaxReasoning(payload, resolvedModel, req, format) {
+  // Factory's GLM 5.2 custom model is transported through the Anthropic
+  // Claude Sonnet shim for compatibility, but the target UMANS model supports
+  // max reasoning. Keep this override scoped to Factory's explicit target
+  // header so other proxy clients keep their selected reasoning behavior.
+  const targetOverride = getTargetModelOverride(req);
+  if (targetOverride !== 'umans-glm-5.2' || resolvedModel !== 'umans-glm-5.2') return false;
+  const budget = REASONING_LEVEL_BUDGETS.max;
+  if (format === 'anthropic') {
+    payload.thinking = { type: 'enabled', budget_tokens: budget };
+  } else {
+    payload.thinking = { type: 'enabled', budgetTokens: budget };
+  }
+  return true;
+}
+
 const MAX_VISION_HANDOFF_CONTEXT_CHARS = 6000;
 
 function normalizeVisionHandoffContext(value) {
@@ -2686,6 +2907,7 @@ async function handleHealthz(req, res) {
     runtime_version: RUNTIME_VERSION,
     port: parseListenPort(config.listenAddr),
     cache: { ...responseCache.stats, enabled: config.cacheEnabled },
+    gateway: gatewayMetrics(),
     sleev: { enabled: config.sleevEnabled === true, ready: sleevState.ready, gateway: SLEEV_GATEWAY_BASE },
   });
 }
@@ -2710,21 +2932,35 @@ async function handleModels(req, res) {
 }
 
 function processQueue() {
-  if (requestQueue.length === 0) return;
-  const limit = getEffectiveConcurrency().limit;
-  if (limit === null) return;
-  while (requestQueue.length > 0 && activeRequests < limit) {
-    const item = requestQueue.shift();
-    if (item.res.writableEnded) continue;
-    activeRequests++;
-    if (item.format === 'anthropic') {
-      proxyAnthropicRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.req)
-        .finally(() => { activeRequests--; processQueue(); });
-    } else {
-      proxyChatRequest(item.res, item.payload, item.model, item.writeError, item.writePassthroughError, item.req)
-        .finally(() => { activeRequests--; processQueue(); });
-    }
+  if (requestQueue.length === 0) {
+    scheduleSessionLeasePrune();
+    return;
   }
+  const circuit = getRateLimitCircuitState();
+  if (circuit.open) {
+    rejectQueuedForCircuit(circuit);
+    return;
+  }
+
+  pruneSessionLeases();
+  let started = false;
+  do {
+    started = false;
+    for (let i = 0; i < requestQueue.length; i++) {
+      const item = requestQueue[i];
+      if (item.res.writableEnded) {
+        requestQueue.splice(i, 1);
+        i--;
+        continue;
+      }
+      if (!canStartGatewayItem(item)) continue;
+      requestQueue.splice(i, 1);
+      startGatewayItem(item);
+      started = true;
+      break;
+    }
+  } while (started);
+  scheduleSessionLeasePrune();
 }
 
 async function handleChatCompletions(req, res) {
@@ -2736,21 +2972,24 @@ async function handleChatCompletions(req, res) {
   const requestedModel = (payload.model || '').trim();
   if (!requestedModel) { writeOpenAIError(res, 400, 'model is required', 'invalid_request_error', ''); return; }
 
-  const limit = getEffectiveConcurrency().limit;
-  if (limit !== null && activeRequests >= limit) {
-    requestQueue.push({ res, payload, model: requestedModel, writeError: writeOpenAIError, writePassthroughError, req });
+  const item = { res, payload, model: requestedModel, writeError: writeOpenAIError, writePassthroughError, req, format: 'openai', fingerprint: fingerprintPayload(payload) };
+  const circuit = getRateLimitCircuitState();
+  if (circuit.open) {
+    writeGatewayRateLimitError(res, 'openai', circuit);
     return;
   }
-  activeRequests++;
-  proxyChatRequest(res, payload, requestedModel, writeOpenAIError, writePassthroughError, req)
-    .finally(() => { activeRequests--; processQueue(); });
+  if (!canStartGatewayItem(item)) {
+    enqueueGatewayItem(item);
+    return;
+  }
+  startGatewayItem(item);
 }
 
-async function proxyAnthropicRequest(res, payload, requestedModel, writeError, writePassthroughError, req) {
+async function proxyAnthropicRequest(res, payload, requestedModel, writeError, writePassthroughError, req, knownFingerprint = null) {
   const reqStart = Date.now();
   const isStream = payload.stream === true;
 
-  const fingerprint = fingerprintPayload(payload);
+  const fingerprint = knownFingerprint ?? fingerprintPayload(payload);
   const cachedSession = fingerprint != null ? touchConversation(fingerprint) : undefined;
 
   let slot;
@@ -2776,6 +3015,7 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
   } else {
     session = { tokenIndex: slot.index, requestCount: 1, sessNum: ++globalSessionCounter };
   }
+  refreshSessionLease(fingerprint, session);
   const sessNum = session.sessNum;
 
   if (session.requestCount === 1) {
@@ -2787,6 +3027,7 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
   await getCatalogData().catch(e => console.log(`[Catalog] load before anthropic handoff skipped: ${e.message}`));
   const resolvedAnthropicModel = resolveModelId(requestedModel, req);
   payload.model = resolvedAnthropicModel;
+  forceFactoryGlm52MaxReasoning(payload, resolvedAnthropicModel, req, 'anthropic');
   await performVisionHandoff(payload, resolvedAnthropicModel, slot, sessNum, reqStart, 'anthropic');
 
   try {
@@ -2805,6 +3046,7 @@ async function proxyAnthropicRequest(res, payload, requestedModel, writeError, w
         request: { method: 'POST', url: `http://localhost${req?.url || '/v1/messages'}`, headers: redactHeaders(req?.headers || {}), body: redactBodyJson(JSON.stringify(payload).substring(0, 2000)) },
         upstream: { url: `${upstream.baseURL}/messages`, method: 'POST', status: upstreamStatus, body: (errText || '').substring(0, 500) },
       });
+      recordRateLimitCircuit(upstreamStatus, errText);
       writePassthroughError(res, upstreamStatus, errText);
       // The Anthropic pass-through has no retry loop, so marking the key
       // unhealthy on a 500/502/503 only poisons the key for subsequent
@@ -2846,24 +3088,27 @@ async function handleAnthropicMessages(req, res) {
   // image-count cap the OpenAI path uses so UMANS never sees > MAX_IMAGES images.
   limitImagesInMessages(anthropicPayload, config.maxImages);
 
-  const limit = getEffectiveConcurrency().limit;
-  if (limit !== null && activeRequests >= limit) {
-    requestQueue.push({ res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, req, format: 'anthropic' });
+  const item = { res, payload: anthropicPayload, model: requestedModel, writeError: writeAnthropicError, writePassthroughError: writeAnthropicPassthroughError, req, format: 'anthropic', fingerprint: fingerprintPayload(anthropicPayload) };
+  const circuit = getRateLimitCircuitState();
+  if (circuit.open) {
+    writeGatewayRateLimitError(res, 'anthropic', circuit);
     return;
   }
-  activeRequests++;
-  proxyAnthropicRequest(res, anthropicPayload, requestedModel, writeAnthropicError, writeAnthropicPassthroughError, req)
-    .finally(() => { activeRequests--; processQueue(); });
+  if (!canStartGatewayItem(item)) {
+    enqueueGatewayItem(item);
+    return;
+  }
+  startGatewayItem(item);
 }
 
-async function proxyChatRequest(res, payload, requestedModel, writeError, writeUpstreamError, req) {
+async function proxyChatRequest(res, payload, requestedModel, writeError, writeUpstreamError, req, knownFingerprint = null) {
   const reqStart = Date.now();
   const requestMethod = req?.method;
   const requestUrl = req ? `http://localhost${req.url}` : null;
   const requestHeaders = req ? redactHeaders(req.headers) : null;
   const requestBodyJson = payload ? redactBodyJson(JSON.stringify(payload)) : null;
 
-  const fingerprint = fingerprintPayload(payload);
+  const fingerprint = knownFingerprint ?? fingerprintPayload(payload);
   let cachedSession = fingerprint != null ? touchConversation(fingerprint) : undefined;
 
   let slot;
@@ -2889,6 +3134,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
   } else {
     session = { tokenIndex: slot.index, requestCount: 1, sessNum: ++globalSessionCounter };
   }
+  refreshSessionLease(fingerprint, session);
   const sessNum = session.sessNum;
   const requestedStream = payload.stream === true;
 
@@ -2935,6 +3181,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
   if (reasoningCaps?.supported === true && reasoningCaps.can_disable === false) {
     payload.thinking = { type: 'adaptive' };
   }
+  forceFactoryGlm52MaxReasoning(payload, resolvedModel, req, 'openai');
 
   await performVisionHandoff(payload, resolvedModel, slot, sessNum, reqStart, 'openai');
 
@@ -3014,6 +3261,7 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
     }
 
     const errorBodyStr = await readBodyText(resp.body);
+    recordRateLimitCircuit(resp.status, errorBodyStr);
 
     if (resp.status === 500 || resp.status === 503) {
       keyPool.markUnhealthy(slot.index, resp.status);
@@ -3434,7 +3682,7 @@ async function handleRequest(req, res) {
       try {
         const data = await fetchConcurrency();
         const effective = getEffectiveConcurrency();
-        writeJSON(res, 200, { ...data, ...effective, active: activeRequests, queued: requestQueue.length });
+        writeJSON(res, 200, { ...data, ...effective, active: activeRequests, queued: requestQueue.length, gateway: gatewayMetrics() });
       } catch (e) {
         if (!res.writableEnded) writeJSON(res, 500, { error: e.message });
       }

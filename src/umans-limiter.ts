@@ -12,7 +12,7 @@ type QueueEntry = {
 const upstreamBase = new URL(process.env.UMANS_LIMITER_UPSTREAM ?? "https://api.code.umans.ai");
 const hostname = process.env.UMANS_LIMITER_HOST ?? "127.0.0.1";
 const port = Number.parseInt(process.env.UMANS_LIMITER_PORT ?? "8318", 10);
-const maxConcurrent = Math.max(1, Number.parseInt(process.env.UMANS_LIMITER_MAX_CONCURRENCY ?? "4", 10));
+const maxConcurrent = Math.max(1, Number.parseInt(process.env.UMANS_LIMITER_MAX_CONCURRENCY ?? "3", 10));
 
 let active = 0;
 let completed = 0;
